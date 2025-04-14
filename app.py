@@ -5,23 +5,31 @@ import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
 from datetime import datetime
-import warnings
-warnings.filterwarnings("ignore")
+import os
 
-app = Flask(__name__, static_url_path='', static_folder='static')
+app = Flask(__name__, static_folder='static', static_url_path='')
 
-# === Firebase Setup ===
-cred_path = "precisionagri-3a0e3-firebase-adminsdk-fbsvc-4d014220cd.json"
-db_url = "https://precisionagri-3a0e3-default-rtdb.firebaseio.com/"
+# === [1] Firebase Setup ===
+# Make sure this file exists in your root (uploaded to Render or local testing)
+FIREBASE_KEY_PATH = "precisionagri-3a0e3-firebase-adminsdk-fbsvc-4d014220cd.json"
+FIREBASE_DB_URL = "https://precisionagri-3a0e3-default-rtdb.firebaseio.com/"
 
 if not firebase_admin._apps:
-    cred = credentials.Certificate(cred_path)
-    firebase_admin.initialize_app(cred, {'databaseURL': db_url})
+    if not os.path.exists(FIREBASE_KEY_PATH):
+        raise FileNotFoundError(f"Firebase key file not found at '{FIREBASE_KEY_PATH}'")
+    cred = credentials.Certificate(FIREBASE_KEY_PATH)
+    firebase_admin.initialize_app(cred, {'databaseURL': FIREBASE_DB_URL})
 
-# === Load & Train Model ===
-df = pd.read_csv("your_dataset.csv")
-label_encoder = LabelEncoder()
-df['crop_type'] = label_encoder.fit_transform(df['crop_type'])
+# === [2] Load CSV Data and Train Model ===
+DATA_PATH = "smart_irrigation_data.csv"  # Replace with your dataset filename
+
+if not os.path.exists(DATA_PATH):
+    raise FileNotFoundError(f"Dataset CSV not found at '{DATA_PATH}'")
+
+df = pd.read_csv(DATA_PATH)
+if 'crop_type' in df.columns:
+    label_encoder = LabelEncoder()
+    df['crop_type'] = label_encoder.fit_transform(df['crop_type'])
 
 X = df[['soil_moisture', 'humidity', 'temperature', 'crop_type']]
 y = df['irrigation_needed']
@@ -29,15 +37,17 @@ y = df['irrigation_needed']
 model = RandomForestClassifier()
 model.fit(X, y)
 
-# === Firebase Reading ===
+# === [3] Read Live Sensor Data from Firebase ===
 def fetch_live_data():
     ref = db.reference('sensor')
     data = ref.get()
 
     if not data:
-        raise ValueError("No sensor data found")
+        raise ValueError("No live sensor data found in Firebase.")
 
-    soil_moisture = 100 - ((float(data.get("soilMoisture", 0)) / 4095) * 100)
+    # Convert ADC to percentage
+    soil_raw = float(data.get("soilMoisture", 0))
+    soil_moisture = 100 - ((soil_raw / 4095) * 100)
 
     return {
         "soil_moisture": round(soil_moisture, 2),
@@ -46,25 +56,27 @@ def fetch_live_data():
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
 
-# === API Endpoint ===
+# === [4] API Endpoint to Get Prediction ===
 @app.route('/api/irrigation', methods=['GET'])
 def irrigation_api():
     try:
-        crop_type = int(request.args.get("crop_type", 0))  # default crop_type = 0
-        reading = fetch_live_data()
-        reading['crop_type'] = crop_type
+        crop_type = int(request.args.get("crop_type", 0))  # e.g., 0 = Wheat
+        live = fetch_live_data()
+        live['crop_type'] = crop_type
 
-        input_df = pd.DataFrame([reading])
+        input_df = pd.DataFrame([live])
         pred = model.predict(input_df[['soil_moisture', 'humidity', 'temperature', 'crop_type']])
-        reading['irrigation_needed'] = int(pred[0])
-        return jsonify(reading)
+        live['irrigation_needed'] = int(pred[0])
+
+        return jsonify(live)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# === Serve Frontend ===
+# === [5] Serve Frontend Page ===
 @app.route('/')
 def index():
     return send_from_directory('static', 'index.html')
 
+# === [6] Run App ===
 if __name__ == '__main__':
     app.run(debug=True)
